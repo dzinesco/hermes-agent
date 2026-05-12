@@ -19,7 +19,7 @@ from typing import Any, Dict, List, Optional, Tuple
 # ---------------------------------------------------------------------------
 
 MONEYFLOW_DIR = os.environ.get("MONEYFLOW_DIR", "/home/tyler/dev/prod/edi/cuntx")
-MONEYFLOW_DB = os.environ.get("MONEYFLOW_DB", f"{MONEYFLOW_DIR}/cuntx.db")
+MONEYFLOW_DB = os.environ.get("MONEYFLOW_DB", f"{MONEYFLOW_DIR}/backend/cuntx.db")
 
 
 # ---------------------------------------------------------------------------
@@ -63,31 +63,33 @@ class DashboardStats:
 
 
 def get_dashboard_stats() -> DashboardStats:
-    """Fetch current dashboard stats from SQLite."""
+    """Fetch current dashboard stats from the real MoneyFlow SQLite DB."""
     conn = get_db()
     try:
         claims_row = conn.execute(
-            "SELECT COUNT(*) as count, COALESCE(SUM(billed_amount), 0) as total FROM claims"
+            "SELECT COUNT(*) as count, COALESCE(SUM(total_charge), 0) as total FROM claims_summary"
         ).fetchone()
 
         runs_row = conn.execute(
-            "SELECT COUNT(*) as count FROM submitted"
+            "SELECT COUNT(*) as count FROM runs"
         ).fetchone()
 
+        # EVV required claims (evv_required = 1 in claims_summary)
         evv_row = conn.execute("""
             SELECT
-                SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-                SUM(CASE WHEN status = 'validated' THEN 1 ELSE 0 END) as validated,
-                SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
-            FROM evv_queue
+                SUM(CASE WHEN evv_required = 1 AND status = 'pending' THEN 1 ELSE 0 END) as pending,
+                SUM(CASE WHEN evv_required = 1 AND status = 'processed' THEN 1 ELSE 0 END) as validated,
+                SUM(CASE WHEN evv_required = 1 AND status = 'rejected' THEN 1 ELSE 0 END) as failed
+            FROM claims_summary
         """).fetchone()
 
+        # Underpayments: where paid < billed (allowed_amount or paid_amount < total_charge)
         up_row = conn.execute("""
             SELECT
-                COALESCE(SUM(ABS(variance)), 0) as total,
+                COALESCE(SUM(total_charge - COALESCE(paid_amount, 0)), 0) as total,
                 COUNT(*) as count
-            FROM underpayments
-            WHERE variance < 0
+            FROM claims_summary
+            WHERE paid_amount < total_charge
         """).fetchone()
 
         return DashboardStats(
@@ -371,23 +373,33 @@ class UnderpaymentRecord:
 
 
 def detect_oa18_underpayments(claims: Optional[List[Claim]] = None) -> List[UnderpaymentRecord]:
-    """Detect OA-18 denials and payment variances from claims or DB."""
+    """Detect OA-18 denials and payment variances from claims or DB.
+
+    OA-18 is "Coordination of Benefits / Other Insurance" denial.
+    Real schema uses claims_summary with total_charge, paid_amount, denial_reason.
+    """
     if claims is None:
         rows = db_query("""
-            SELECT claim_id, payer, denial_code, billed_amount, paid_amount,
-                   variance, date_of_service
-            FROM claims
-            WHERE denial_code = 'OA-18' OR variance < 0
+            SELECT claim_id, payer, denial_reason, total_charge, paid_amount,
+                   allowed_amount, service_date, status
+            FROM claims_summary
+            WHERE denial_reason LIKE '%OA-18%'
+               OR denial_reason LIKE '%other insurance%'
+               OR denial_reason LIKE '%OON%'
+               OR (paid_amount IS NOT NULL AND paid_amount < total_charge)
+            ORDER BY (total_charge - COALESCE(paid_amount, 0)) DESC
+            LIMIT 100
         """)
         return [
             UnderpaymentRecord(
-                claim_id=r["claim_id"],
+                claim_id=r["claim_id"] or "",
                 payer=r["payer"] or "",
-                denial_code=r["denial_code"] or "",
-                billed=float(r["billed_amount"] or 0),
+                denial_code=r["denial_reason"] or "",
+                billed=float(r["total_charge"] or 0),
                 paid=float(r["paid_amount"] or 0),
-                variance=float(r["variance"] or 0),
-                date_of_service=r["date_of_service"],
+                variance=float((r["total_charge"] or 0) - (r["paid_amount"] or 0)),
+                date_of_service=r["service_date"],
+                status=r["status"] or "",
             )
             for r in rows
         ]
@@ -425,38 +437,40 @@ class EVVQueueItem:
 
 
 def get_evv_pending() -> List[EVVQueueItem]:
-    """Get all pending EVV validations."""
+    """Get EVV-required claims pending validation."""
     rows = db_query("""
-        SELECT claim_id, service_date, caregiver_id, patient_id, status,
-               error_code, error_message, retry_count
-        FROM evv_queue
-        WHERE status = 'pending'
+        SELECT claim_id, service_date, patient_name, status,
+               denial_reason, procedure_code, modifiers
+        FROM claims_summary
+        WHERE evv_required = 1
+          AND status IN ('pending', 'rejected', 'evv_pending')
         ORDER BY service_date ASC
+        LIMIT 100
     """)
     return [
         EVVQueueItem(
-            claim_id=r["claim_id"],
+            claim_id=r["claim_id"] or "",
             service_date=r["service_date"] or "",
-            caregiver_id=r["caregiver_id"] or "",
-            patient_id=r["patient_id"] or "",
+            caregiver_id="",  # not in claims_summary
+            patient_id=r["patient_name"] or "",
             status=r["status"] or "pending",
-            error_code=r.get("error_code", "") or "",
-            error_message=r.get("error_message", "") or "",
-            retry_count=r.get("retry_count", 0) or 0,
+            error_code=r.get("denial_reason", "") or "",
+            error_message=r.get("denial_reason", "") or "",
+            retry_count=0,
         )
         for r in rows
     ]
 
 
 def get_evv_summary() -> Dict[str, int]:
-    """Get EVV queue summary counts."""
+    """Get EVV queue summary counts from claims_summary."""
     rows = db_query("""
         SELECT
             COUNT(*) as total,
-            SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END) as pending,
-            SUM(CASE WHEN status = 'validated' THEN 1 ELSE 0 END) as validated,
-            SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) as failed
-        FROM evv_queue
+            SUM(CASE WHEN evv_required = 1 AND status = 'pending' THEN 1 ELSE 0 END) as pending,
+            SUM(CASE WHEN evv_required = 1 AND status = 'processed' THEN 1 ELSE 0 END) as validated,
+            SUM(CASE WHEN evv_required = 1 AND status = 'rejected' THEN 1 ELSE 0 END) as failed
+        FROM claims_summary
     """)
     if rows:
         row = rows[0]
