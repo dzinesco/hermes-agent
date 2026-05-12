@@ -1,0 +1,9 @@
+services:
+  hermes-cuntx:
+    build: .
+    volumes:
+      - ./custom-skills:/app/custom-skills
+      - ./moneyflow.db:/app/moneyflow.db
+    environment:
+      - HERMES_SKILLS_DIR=/app/custom-skills/moneyflow-837p
+      - MONEYFLOW_API=http://localhost:8000
